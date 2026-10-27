@@ -1,5 +1,6 @@
 stages:
   - lint-and-validate
+  - bake-ami
   - plan-rehydration
   - execute-rehydration
   - verify-health
@@ -10,29 +11,71 @@ variables:
   AWS_DEFAULT_REGION: "us-east-1"
   MIN_HEALTHY_PERCENT: "90"
   INSTANCE_WARMUP_SEC: "300"
+  ASG_NAME: "production-asg"
 
-default:
+# Reusable template for Terraform jobs
+.terraform-base:
   image: hashicorp/terraform:1.6
   before_script:
     - cd ${TF_ROOT}
-    - terraform init -backend=false
+    - terraform init
 
 lint-iac:
+  extends: .terraform-base
   stage: lint-and-validate
+  before_script:
+    - cd ${TF_ROOT}
+    - terraform init -backend=false
   script:
     - terraform fmt -check
     - terraform validate
 
-plan-instance-refresh:
-  stage: plan-rehydration
+bake-golden-ami:
+  stage: bake-ami
+  image:
+    name: hashicorp/packer:1.9
+    entrypoint: [""]
+  before_script: []
   script:
-    - terraform plan -var="min_healthy_percentage=${MIN_HEALTHY_PERCENT}" -out=tfplan.binary
+    - cd packer
+    - packer init golden-ami.pkr.hcl
+    - packer build -color=false golden-ami.pkr.hcl
+  artifacts:
+    paths:
+      - packer/packer-manifest.json
+    expire_in: 2 hours
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+plan-instance-refresh:
+  extends: .terraform-base
+  stage: plan-rehydration
+  image:
+    name: hashicorp/terraform:1.6
+    entrypoint: [""]
+  before_script:
+    - apk add --no-cache jq
+    - cd ${TF_ROOT}
+    - terraform init
+  script:
+    - >
+      TARGET_AMI_ID=$(jq -r '.builds[-1].artifact_id' ../packer/packer-manifest.json | cut -d':' -f2)
+    - echo "Deploying Golden AMI: ${TARGET_AMI_ID}"
+    - >
+      terraform plan \
+        -var="target_ami_id=${TARGET_AMI_ID}" \
+        -var="min_healthy_percentage=${MIN_HEALTHY_PERCENT}" \
+        -var="instance_warmup_sec=${INSTANCE_WARMUP_SEC}" \
+        -out=tfplan.binary
   artifacts:
     paths:
       - ${TF_ROOT}/tfplan.binary
     expire_in: 2 hours
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
 
 execute-refresh:
+  extends: .terraform-base
   stage: execute-rehydration
   script:
     - terraform apply -auto-approve tfplan.binary
@@ -46,21 +89,27 @@ verify-rehydration:
   before_script:
     - yum install -y jq curl
   script:
-    - chmod +x ../scripts/verify-rehydration.sh
-    - ../scripts/verify-rehydration.sh
+    - chmod +x ./scripts/verify-rehydration.sh
+    - ./scripts/verify-rehydration.sh
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
 
 auto-rollback:
   stage: rollback-on-failure
   image: amazon/aws-cli:2.15.0
+  before_script: []
   when: on_failure
   script:
-    - echo "Rehydration failed health gates. Rolling back Auto Scaling Group instance refresh..."
+    - echo "Health checks failed. Rolling back Auto Scaling Group instance refresh..."
     - >
       REFRESH_ID=$(aws autoscaling describe-instance-refreshes \
         --auto-scaling-group-name "${ASG_NAME}" \
-        --query "InstanceRefreshes[0].InstanceRefreshId" --output text)
+        --query "InstanceRefreshes[?Status=='InProgress'].InstanceRefreshId | [0]" \
+        --output text)
     - >
-      aws autoscaling cancel-instance-refresh \
-        --auto-scaling-group-name "${ASG_NAME}" || true
+      if [ "${REFRESH_ID}" != "None" ] && [ -n "${REFRESH_ID}" ]; then
+        aws autoscaling cancel-instance-refresh \
+          --auto-scaling-group-name "${ASG_NAME}"
+      else
+        echo "No active instance refresh found to cancel."
+      fi

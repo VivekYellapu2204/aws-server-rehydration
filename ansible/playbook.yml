@@ -1,0 +1,149 @@
+---
+- name: Bake and Harden Immutable Application AMI
+  hosts: default
+  become: true
+  gather_facts: true
+
+  vars:
+    app_user: "apprunner"
+    app_group: "apprunner"
+    app_port: 8080
+    app_home: "/opt/application"
+
+  tasks:
+    - name: Ensure OS core dependencies are up-to-date
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_cache: true
+
+    - name: Install baseline system utilities and runtime agents
+      ansible.builtin.dnf:
+        name:
+          - amazon-ssm-agent
+          - amazon-cloudwatch-agent
+          - python3
+          - curl
+          - jq
+        state: present
+
+    - name: Create non-privileged system group for application execution
+      ansible.builtin.group:
+        name: "{{ app_group }}"
+        state: present
+        system: true
+
+    - name: Create non-privileged system user without interactive shell
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        home: "{{ app_home }}"
+        shell: /sbin/nologin
+        system: true
+        create_home: true
+
+    - name: Set permissions on application directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0750'
+      loop:
+        - "{{ app_home }}"
+        - "{{ app_home }}/bin"
+        - "/var/log/application"
+
+    - name: Deploy application health-check responder script
+      ansible.builtin.copy:
+        dest: "{{ app_home }}/bin/healthcheck_server.py"
+        content: |
+          #!/usr/bin/env python3
+          import http.server
+          import socketserver
+
+          PORT = {{ app_port }}
+
+          class HealthHandler(http.server.SimpleHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == '/healthz':
+                      self.send_response(200)
+                      self.send_header('Content-type', 'text/plain')
+                      self.end_headers()
+                      self.wfile.write(b"OK\n")
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+
+          with socketserver.TCPServer(("", PORT), HealthHandler) as httpd:
+              httpd.serve_forever()
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0755'
+
+    - name: Configure systemd service for app management
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/app.service
+        content: |
+          [Unit]
+          Description=Application Daemon for Server Rehydration Fleet
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_home }}
+          ExecStart=/usr/bin/python3 {{ app_home }}/bin/healthcheck_server.py
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reload systemd configuration
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable system services to start on boot
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+      loop:
+        - amazon-ssm-agent
+        - app.service
+
+    # Image Sanitization (Required for AMI Immutability and Identity Reset)
+    - name: Remove unique machine identifiers
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/machine-id
+        - /var/lib/dbus/machine-id
+
+    - name: Recreate empty machine-id file
+      ansible.builtin.file:
+        path: /etc/machine-id
+        state: touch
+        mode: '0444'
+
+    - name: Clean cloud-init runtime data and logs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/cloud/instances
+        - /var/log/cloud-init.log
+        - /var/log/cloud-init-output.log
+
+    - name: Clear package manager cache and temporal artifacts
+      ansible.builtin.shell: |
+        dnf clean all
+        rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+        history -c
+      changed_when: false

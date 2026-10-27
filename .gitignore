@@ -1,0 +1,29 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan*
+*.binary
+crash.log
+crash.*.log
+*.tfvars
+!*.tfvars.example
+
+# Packer
+packer_cache/
+*.pkr.hcl.lock
+packer-manifest.json
+
+# Ansible
+*.retry
+.ansible/
+
+# Shell & Scripts
+*.log
+
+# System & Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,66 @@
+stages:
+  - lint-and-validate
+  - plan-rehydration
+  - execute-rehydration
+  - verify-health
+  - rollback-on-failure
+
+variables:
+  TF_ROOT: "terraform"
+  AWS_DEFAULT_REGION: "us-east-1"
+  MIN_HEALTHY_PERCENT: "90"
+  INSTANCE_WARMUP_SEC: "300"
+
+default:
+  image: hashicorp/terraform:1.6
+  before_script:
+    - cd ${TF_ROOT}
+    - terraform init -backend=false
+
+lint-iac:
+  stage: lint-and-validate
+  script:
+    - terraform fmt -check
+    - terraform validate
+
+plan-instance-refresh:
+  stage: plan-rehydration
+  script:
+    - terraform plan -var="min_healthy_percentage=${MIN_HEALTHY_PERCENT}" -out=tfplan.binary
+  artifacts:
+    paths:
+      - ${TF_ROOT}/tfplan.binary
+    expire_in: 2 hours
+
+execute-refresh:
+  stage: execute-rehydration
+  script:
+    - terraform apply -auto-approve tfplan.binary
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+verify-rehydration:
+  stage: verify-health
+  image: amazon/aws-cli:2.15.0
+  before_script:
+    - yum install -y jq curl
+  script:
+    - chmod +x ../scripts/verify-rehydration.sh
+    - ../scripts/verify-rehydration.sh
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+auto-rollback:
+  stage: rollback-on-failure
+  image: amazon/aws-cli:2.15.0
+  when: on_failure
+  script:
+    - echo "Rehydration failed health gates. Rolling back Auto Scaling Group instance refresh..."
+    - >
+      REFRESH_ID=$(aws autoscaling describe-instance-refreshes \
+        --auto-scaling-group-name "${ASG_NAME}" \
+        --query "InstanceRefreshes[0].InstanceRefreshId" --output text)
+    - >
+      aws autoscaling cancel-instance-refresh \
+        --auto-scaling-group-name "${ASG_NAME}" || true
